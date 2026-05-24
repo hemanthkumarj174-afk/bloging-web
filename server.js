@@ -5,7 +5,7 @@ const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 
 const PORT = Number(process.env.PORT || 3000);
-const DATA_DIR = path.join(__dirname, "data");
+const DATA_DIR = process.env.VERCEL ? "/tmp/blogging-platform" : path.join(__dirname, "data");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DB_PATH = path.join(DATA_DIR, "blog.sqlite");
 const SECRET = process.env.AUTH_SECRET || "dev-secret-change-me";
@@ -346,7 +346,7 @@ function serveStatic(req, res, url) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
     if (url.pathname.startsWith("/api/")) {
@@ -358,8 +358,14 @@ const server = http.createServer(async (req, res) => {
     console.error(error);
     json(res, 500, { error: error.message || "Server error" });
   }
-});
+}
 
-server.listen(PORT, () => {
-  console.log(`Blogging platform running at http://localhost:${PORT}`);
-});
+const server = http.createServer(handleRequest);
+
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log(`Blogging platform running at http://localhost:${PORT}`);
+  });
+}
+
+module.exports = handleRequest;
