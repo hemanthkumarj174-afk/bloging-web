@@ -22,12 +22,26 @@ function clearSession() {
   syncNav();
 }
 
+function canWritePosts() {
+  return state.user && ["writer", "admin"].includes(state.user.role);
+}
+
+function isAdmin() {
+  return state.user && state.user.role === "admin";
+}
+
 function syncNav() {
   document.querySelectorAll(".auth-only").forEach(el => {
     el.style.display = state.user ? "" : "none";
   });
   document.querySelectorAll(".guest-only").forEach(el => {
     el.style.display = state.user ? "none" : "";
+  });
+  document.querySelectorAll(".writer-only").forEach(el => {
+    el.style.display = canWritePosts() ? "" : "none";
+  });
+  document.querySelectorAll(".admin-only").forEach(el => {
+    el.style.display = isAdmin() ? "" : "none";
   });
 }
 
@@ -40,8 +54,18 @@ async function api(path, options = {}) {
       ...(options.headers || {})
     }
   });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "Something went wrong");
+
+  const text = await response.text();
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`Expected JSON but received ${response.status} ${response.statusText}. Check the API route or deployment logs.`);
+    }
+  }
+
+  if (!response.ok) throw new Error(data.error || data.message || "Something went wrong");
   return data;
 }
 
@@ -77,12 +101,21 @@ function pageTitle(title, subtitle = "") {
   `;
 }
 
+function userRoleLabel(user = state.user) {
+  if (!user) return "guest";
+  return user.role || "writer";
+}
+
+function canModifyPost(post) {
+  return state.user && (isAdmin() || state.user.id === post.author.id);
+}
+
 function renderPostCard(post) {
   const template = document.querySelector("#postCardTemplate");
   const card = template.content.firstElementChild.cloneNode(true);
   card.querySelector("img").src = post.imageUrl || fallbackImage;
   card.querySelector("img").alt = post.title;
-  card.querySelector(".meta").textContent = `${post.author.name} · ${formatDate(post.createdAt)}`;
+  card.querySelector(".meta").textContent = `${post.author.name} - ${formatDate(post.createdAt)}`;
   card.querySelector("h2").textContent = post.title;
   card.querySelector("p").textContent = post.excerpt;
   const tags = card.querySelector(".tags");
@@ -96,13 +129,13 @@ async function renderHome() {
     <section class="hero">
       <div>
         <h1>Inkline</h1>
-        <p>Write useful posts, manage your own articles, and keep the conversation going through comments.</p>
+        <p>Write useful posts, manage articles by role, and keep the conversation going through comments.</p>
         <div class="actions">
           <button class="button primary" data-action="write">Write a post</button>
           <button class="button" data-action="dashboard">My dashboard</button>
         </div>
       </div>
-      <div class="hero-panel"><strong>Full-stack content management with users, posts, APIs, and a relational database.</strong></div>
+      <div class="hero-panel"><strong>Full-stack content management with auth, roles, posts, comments, and reset flows.</strong></div>
     </section>
     <section class="grid" id="postsGrid"></section>
   `;
@@ -113,7 +146,7 @@ async function renderHome() {
   const { posts } = await api("/api/posts");
   const grid = app.querySelector("#postsGrid");
   if (!posts.length) {
-    grid.outerHTML = `<div class="empty">No posts yet. Register or log in to publish the first article.</div>`;
+    grid.outerHTML = `<div class="empty">No posts yet. Register as a writer or log in as admin to publish.</div>`;
     return;
   }
   posts.forEach(post => grid.appendChild(renderPostCard(post)));
@@ -122,22 +155,33 @@ async function renderHome() {
 function authForm(mode) {
   const isRegister = mode === "register";
   app.innerHTML = `
-    ${pageTitle(isRegister ? "Create Account" : "Login", isRegister ? "Start writing and commenting with your own profile." : "Welcome back.")}
+    ${pageTitle(isRegister ? "Create Account" : "Login", isRegister ? "Choose reader for comments or writer for blog publishing." : "Welcome back.")}
     <section class="panel">
       <form class="form compact">
         <div id="formError"></div>
         ${isRegister ? `<label>Name <input name="name" autocomplete="name" required /></label>` : ""}
         <label>Email <input name="email" type="email" autocomplete="email" required /></label>
         <label>Password <input name="password" type="password" autocomplete="${isRegister ? "new-password" : "current-password"}" minlength="6" required /></label>
+        ${isRegister ? `
+          <label>Account type
+            <select name="role">
+              <option value="writer">Blog writer</option>
+              <option value="reader">Reader</option>
+            </select>
+          </label>
+        ` : ""}
         <div class="actions">
           <button class="button primary" type="submit">${isRegister ? "Register" : "Login"}</button>
           <button class="button" type="button" data-switch>${isRegister ? "Use existing account" : "Create account"}</button>
+          ${isRegister ? "" : `<button class="button" type="button" data-forgot>Forgot password</button>`}
         </div>
       </form>
     </section>
   `;
 
   app.querySelector("[data-switch]").addEventListener("click", () => route(isRegister ? "login" : "register"));
+  const forgot = app.querySelector("[data-forgot]");
+  if (forgot) forgot.addEventListener("click", () => route("forgot-password"));
   app.querySelector("form").addEventListener("submit", async event => {
     event.preventDefault();
     const payload = Object.fromEntries(new FormData(event.currentTarget));
@@ -151,18 +195,90 @@ function authForm(mode) {
   });
 }
 
+function forgotPasswordForm() {
+  app.innerHTML = `
+    ${pageTitle("Forgot Password", "Generate a reset code for a local/dev account.")}
+    <section class="panel">
+      <form class="form compact">
+        <div id="formMessage"></div>
+        <label>Email <input name="email" type="email" autocomplete="email" required /></label>
+        <button class="button primary" type="submit">Generate reset code</button>
+      </form>
+    </section>
+  `;
+
+  app.querySelector("form").addEventListener("submit", async event => {
+    event.preventDefault();
+    const payload = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      const data = await api("/api/forgot-password", { method: "POST", body: JSON.stringify(payload) });
+      const tokenHtml = data.resetToken
+        ? `<p><strong>Reset code:</strong> <code>${escapeHtml(data.resetToken)}</code></p>`
+        : "";
+      app.querySelector("#formMessage").innerHTML = `
+        <div class="notice">
+          ${escapeHtml(data.message)}
+          ${tokenHtml}
+          <button class="button primary" type="button" data-reset>Continue to reset</button>
+        </div>
+      `;
+      app.querySelector("[data-reset]").addEventListener("click", () => route("reset-password", { email: payload.email, token: data.resetToken || "" }));
+    } catch (error) {
+      app.querySelector("#formMessage").innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+    }
+  });
+}
+
+function resetPasswordForm(params = {}) {
+  app.innerHTML = `
+    ${pageTitle("Reset Password", "Use the reset code to set a new password.")}
+    <section class="panel">
+      <form class="form compact">
+        <div id="formMessage"></div>
+        <label>Email <input name="email" type="email" value="${escapeHtml(params.email || "")}" required /></label>
+        <label>Reset code <input name="token" value="${escapeHtml(params.token || "")}" required /></label>
+        <label>New password <input name="password" type="password" minlength="6" required /></label>
+        <div class="actions">
+          <button class="button primary" type="submit">Reset password</button>
+          <button class="button" type="button" data-login>Back to login</button>
+        </div>
+      </form>
+    </section>
+  `;
+
+  app.querySelector("[data-login]").addEventListener("click", () => route("login"));
+  app.querySelector("form").addEventListener("submit", async event => {
+    event.preventDefault();
+    const payload = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      const data = await api("/api/reset-password", { method: "POST", body: JSON.stringify(payload) });
+      app.querySelector("#formMessage").innerHTML = `<div class="notice">${escapeHtml(data.message)}</div>`;
+      setTimeout(() => route("login"), 900);
+    } catch (error) {
+      app.querySelector("#formMessage").innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+    }
+  });
+}
+
 async function renderDashboard() {
   if (!state.user) return route("login");
   const { posts } = await api("/api/me");
   app.innerHTML = `
-    ${pageTitle("Dashboard", `Manage posts for ${state.user.name}.`)}
-    <div class="actions"><button class="button primary" data-new>New post</button></div>
+    ${pageTitle("Dashboard", `${state.user.name} - ${userRoleLabel()}.`)}
+    <div class="actions">
+      ${canWritePosts() ? `<button class="button primary" data-new>New post</button>` : ""}
+      ${isAdmin() ? `<button class="button" data-admin>Manage users</button>` : ""}
+    </div>
     <section class="grid" id="postsGrid"></section>
   `;
-  app.querySelector("[data-new]").addEventListener("click", () => route("new-post"));
+  const newButton = app.querySelector("[data-new]");
+  if (newButton) newButton.addEventListener("click", () => route("new-post"));
+  const adminButton = app.querySelector("[data-admin]");
+  if (adminButton) adminButton.addEventListener("click", () => route("admin"));
+
   const grid = app.querySelector("#postsGrid");
   if (!posts.length) {
-    grid.outerHTML = `<div class="empty">You have not published anything yet.</div>`;
+    grid.outerHTML = `<div class="empty">No manageable posts yet.</div>`;
     return;
   }
   posts.forEach(post => {
@@ -186,15 +302,16 @@ async function renderDashboard() {
 
 async function postForm(postId = null) {
   if (!state.user) return route("login");
-  let post = { title: "", content: "", tags: [], imageUrl: "" };
+  if (!canWritePosts()) return route("dashboard");
+  let post = { title: "", content: "", tags: [], imageUrl: "", author: {} };
   if (postId) {
     const data = await api(`/api/posts/${postId}`);
     post = data.post;
-    if (post.author.id !== state.user.id) return route("dashboard");
+    if (!canModifyPost(post)) return route("dashboard");
   }
 
   app.innerHTML = `
-    ${pageTitle(postId ? "Edit Post" : "Create Post", "Add a title, body, optional image URL, and comma-separated tags.")}
+    ${pageTitle(postId ? "Edit Post" : "Create Post", "Admins can manage all posts. Writers can manage their own posts.")}
     <section class="panel">
       <form class="form">
         <div id="formError"></div>
@@ -230,15 +347,15 @@ async function postForm(postId = null) {
 
 async function renderPost(id) {
   const { post, comments } = await api(`/api/posts/${id}`);
-  const canEdit = state.user && state.user.id === post.author.id;
+  const editable = canModifyPost(post);
   app.innerHTML = `
     <article class="article">
       <img class="article-image" src="${escapeHtml(post.imageUrl || fallbackImage)}" alt="${escapeHtml(post.title)}" />
       <div>
-        <div class="meta">${escapeHtml(post.author.name)} · ${formatDate(post.createdAt)}</div>
+        <div class="meta">${escapeHtml(post.author.name)} - ${formatDate(post.createdAt)}</div>
         <h1>${escapeHtml(post.title)}</h1>
         <div class="tags">${post.tags.map(tag => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div>
-        ${canEdit ? `<div class="actions"><button class="button primary" data-edit>Edit</button></div>` : ""}
+        ${editable ? `<div class="actions"><button class="button primary" data-edit>Edit</button></div>` : ""}
       </div>
       <div class="article-content">${escapeHtml(post.content).replaceAll("\n", "<br />")}</div>
       <section class="panel">
@@ -255,12 +372,12 @@ async function renderPost(id) {
     </article>
   `;
 
-  if (canEdit) app.querySelector("[data-edit]").addEventListener("click", () => route("edit-post", { id }));
+  if (editable) app.querySelector("[data-edit]").addEventListener("click", () => route("edit-post", { id }));
   const list = app.querySelector("#comments");
   list.innerHTML = comments.length
     ? comments.map(comment => `
       <div class="comment">
-        <div class="meta">${escapeHtml(comment.author.name)} · ${formatDate(comment.createdAt)}</div>
+        <div class="meta">${escapeHtml(comment.author.name)} - ${formatDate(comment.createdAt)}</div>
         <p>${escapeHtml(comment.body)}</p>
       </div>
     `).join("")
@@ -271,8 +388,12 @@ async function renderPost(id) {
     form.addEventListener("submit", async event => {
       event.preventDefault();
       const payload = Object.fromEntries(new FormData(form));
-      await api(`/api/posts/${id}/comments`, { method: "POST", body: JSON.stringify(payload) });
-      renderPost(id);
+      try {
+        await api(`/api/posts/${id}/comments`, { method: "POST", body: JSON.stringify(payload) });
+        renderPost(id);
+      } catch (error) {
+        app.querySelector("#commentNotice").innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+      }
     });
   }
 }
@@ -284,10 +405,60 @@ async function renderProfile() {
     ${pageTitle("Profile", "Your account and publishing activity.")}
     <section class="panel">
       <h2>${escapeHtml(state.user.name)}</h2>
-      <p class="meta">${escapeHtml(state.user.email)}</p>
-      <p>You have published ${posts.length} post${posts.length === 1 ? "" : "s"}.</p>
+      <p class="meta">${escapeHtml(state.user.email)} - ${userRoleLabel()}</p>
+      <p>You can ${canWritePosts() ? "write and manage blog posts" : "read posts and comment"}.</p>
+      <p>You have ${posts.length} manageable post${posts.length === 1 ? "" : "s"}.</p>
     </section>
   `;
+}
+
+async function renderAdmin() {
+  if (!state.user) return route("login");
+  if (!isAdmin()) return route("dashboard");
+  const { users } = await api("/api/users");
+  app.innerHTML = `
+    ${pageTitle("Admin", "Manage user roles.")}
+    <section class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Action</th></tr></thead>
+          <tbody>
+            ${users.map(user => `
+              <tr>
+                <td>${escapeHtml(user.name)}</td>
+                <td>${escapeHtml(user.email)}</td>
+                <td>
+                  <select data-role="${user.id}">
+                    ${["reader", "writer", "admin"].map(role => `<option value="${role}" ${user.role === role ? "selected" : ""}>${role}</option>`).join("")}
+                  </select>
+                </td>
+                <td><button class="button primary" data-save="${user.id}">Save</button></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+      <div id="adminMessage"></div>
+    </section>
+  `;
+
+  app.querySelectorAll("[data-save]").forEach(button => {
+    button.addEventListener("click", async () => {
+      const id = button.dataset.save;
+      const role = app.querySelector(`[data-role="${id}"]`).value;
+      try {
+        await api(`/api/users/${id}/role`, { method: "PUT", body: JSON.stringify({ role }) });
+        if (Number(id) === state.user.id) {
+          state.user.role = role;
+          localStorage.setItem("user", JSON.stringify(state.user));
+          syncNav();
+        }
+        app.querySelector("#adminMessage").innerHTML = `<div class="notice">Role updated.</div>`;
+      } catch (error) {
+        app.querySelector("#adminMessage").innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+      }
+    });
+  });
 }
 
 async function render() {
@@ -296,11 +467,14 @@ async function render() {
   try {
     if (name === "register") return authForm("register");
     if (name === "login") return authForm("login");
+    if (name === "forgot-password") return forgotPasswordForm();
+    if (name === "reset-password") return resetPasswordForm(params);
     if (name === "dashboard") return renderDashboard();
     if (name === "new-post") return postForm();
     if (name === "edit-post") return postForm(params.id);
     if (name === "post") return renderPost(params.id);
     if (name === "profile") return renderProfile();
+    if (name === "admin") return renderAdmin();
     return renderHome();
   } catch (error) {
     app.innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;

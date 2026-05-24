@@ -5,7 +5,7 @@ const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 
 const PORT = Number(process.env.PORT || 3000);
-const DATA_DIR = process.env.VERCEL ? "/tmp/blogging-platform" : path.join(__dirname, "data");
+const DATA_DIR = process.env.DATA_DIR || (process.env.VERCEL ? "/tmp/blogging-platform" : path.join(__dirname, "data"));
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DB_PATH = path.join(DATA_DIR, "blog.sqlite");
 const SECRET = process.env.AUTH_SECRET || "dev-secret-change-me";
@@ -21,6 +21,9 @@ db.exec(`
     name TEXT NOT NULL,
     email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'writer',
+    reset_token_hash TEXT DEFAULT '',
+    reset_expires_at INTEGER DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -46,6 +49,23 @@ db.exec(`
     FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
   );
 `);
+
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name);
+  if (!columns.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+ensureColumn("users", "role", "TEXT NOT NULL DEFAULT 'writer'");
+ensureColumn("users", "reset_token_hash", "TEXT DEFAULT ''");
+ensureColumn("users", "reset_expires_at", "INTEGER DEFAULT 0");
+
+const adminUser = db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get();
+const firstUser = db.prepare("SELECT id FROM users ORDER BY id ASC LIMIT 1").get();
+if (!adminUser && firstUser) {
+  db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(firstUser.id);
+}
 
 function json(res, status, payload) {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -79,6 +99,10 @@ function hashPassword(password) {
   return `${salt}:${hash}`;
 }
 
+function hashToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
 function verifyPassword(password, stored) {
   const [salt, hash] = stored.split(":");
   const candidate = crypto.scryptSync(password, salt, 64);
@@ -99,6 +123,7 @@ function createToken(user) {
     sub: user.id,
     name: user.name,
     email: user.email,
+    role: user.role,
     exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24
   });
   const data = `${header}.${payload}`;
@@ -114,12 +139,15 @@ function getUserFromToken(req) {
   const [header, payload, signature] = parts;
   const data = `${header}.${payload}`;
   const expected = sign(data);
-  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+  const signatureBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (signatureBuffer.length !== expectedBuffer.length) return null;
+  if (!crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) return null;
 
   try {
     const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     if (parsed.exp < Math.floor(Date.now() / 1000)) return null;
-    return db.prepare("SELECT id, name, email, created_at FROM users WHERE id = ?").get(parsed.sub) || null;
+    return db.prepare("SELECT id, name, email, role, created_at FROM users WHERE id = ?").get(parsed.sub) || null;
   } catch {
     return null;
   }
@@ -139,6 +167,28 @@ function validateRequired(fields, body) {
     if (!String(body[field] || "").trim()) return `${field} is required`;
   }
   return "";
+}
+
+function cleanRole(role) {
+  return ["reader", "writer", "admin"].includes(role) ? role : "writer";
+}
+
+function canWritePosts(user) {
+  return user && ["writer", "admin"].includes(user.role);
+}
+
+function canModifyPost(user, post) {
+  return user && (user.role === "admin" || post.author_id === user.id);
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    created_at: user.created_at
+  };
 }
 
 function postListRow(row) {
@@ -167,13 +217,17 @@ async function handleApi(req, res, url) {
     if (String(body.password).length < 6) return json(res, 400, { error: "Password must be at least 6 characters" });
 
     try {
+      const userCount = db.prepare("SELECT COUNT(*) AS count FROM users").get().count;
+      const requestedRole = cleanRole(String(body.role || "writer"));
+      const role = userCount === 0 ? "admin" : requestedRole === "admin" ? "writer" : requestedRole;
       const result = db.prepare("INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)").run(
         String(body.name).trim(),
         String(body.email).trim().toLowerCase(),
         hashPassword(String(body.password))
       );
-      const user = db.prepare("SELECT id, name, email, created_at FROM users WHERE id = ?").get(result.lastInsertRowid);
-      return json(res, 201, { token: createToken(user), user });
+      db.prepare("UPDATE users SET role = ? WHERE id = ?").run(role, result.lastInsertRowid);
+      const user = db.prepare("SELECT id, name, email, role, created_at FROM users WHERE id = ?").get(result.lastInsertRowid);
+      return json(res, 201, { token: createToken(user), user: publicUser(user) });
     } catch (error) {
       if (String(error.message).includes("UNIQUE")) return json(res, 409, { error: "Email is already registered" });
       throw error;
@@ -188,21 +242,93 @@ async function handleApi(req, res, url) {
     }
     return json(res, 200, {
       token: createToken(user),
-      user: { id: user.id, name: user.name, email: user.email, created_at: user.created_at }
+      user: publicUser(user)
     });
+  }
+
+  if (method === "POST" && pathname === "/api/forgot-password") {
+    const body = await readBody(req);
+    const email = String(body.email || "").trim().toLowerCase();
+    const user = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+    if (!user) {
+      return json(res, 200, { message: "If that email exists, a reset code has been generated." });
+    }
+
+    const resetToken = crypto.randomBytes(18).toString("hex");
+    const expiresAt = Date.now() + 15 * 60 * 1000;
+    db.prepare("UPDATE users SET reset_token_hash = ?, reset_expires_at = ? WHERE id = ?").run(
+      hashToken(resetToken),
+      expiresAt,
+      user.id
+    );
+    return json(res, 200, {
+      message: "Reset code generated. In production this would be emailed.",
+      resetToken,
+      expiresAt
+    });
+  }
+
+  if (method === "POST" && pathname === "/api/reset-password") {
+    const body = await readBody(req);
+    const missing = validateRequired(["email", "token", "password"], body);
+    if (missing) return json(res, 400, { error: missing });
+    if (String(body.password).length < 6) return json(res, 400, { error: "Password must be at least 6 characters" });
+
+    const email = String(body.email || "").trim().toLowerCase();
+    const user = db.prepare("SELECT id, reset_token_hash, reset_expires_at FROM users WHERE email = ?").get(email);
+    if (!user || !user.reset_token_hash || user.reset_token_hash !== hashToken(String(body.token))) {
+      return json(res, 400, { error: "Invalid reset code" });
+    }
+    if (Number(user.reset_expires_at) < Date.now()) {
+      return json(res, 400, { error: "Reset code expired" });
+    }
+
+    db.prepare(`
+      UPDATE users
+      SET password_hash = ?, reset_token_hash = '', reset_expires_at = 0
+      WHERE id = ?
+    `).run(hashPassword(String(body.password)), user.id);
+    return json(res, 200, { ok: true, message: "Password reset successful" });
   }
 
   if (method === "GET" && pathname === "/api/me") {
     const user = requireUser(req, res);
     if (!user) return;
-    const posts = db.prepare(`
+    const sql = user.role === "admin" ? `
+      SELECT posts.*, users.name AS author_name
+      FROM posts
+      JOIN users ON users.id = posts.author_id
+      ORDER BY updated_at DESC
+    ` : `
       SELECT posts.*, users.name AS author_name
       FROM posts
       JOIN users ON users.id = posts.author_id
       WHERE author_id = ?
       ORDER BY updated_at DESC
-    `).all(user.id).map(postListRow);
+    `;
+    const posts = user.role === "admin"
+      ? db.prepare(sql).all().map(postListRow)
+      : db.prepare(sql).all(user.id).map(postListRow);
     return json(res, 200, { user, posts });
+  }
+
+  if (method === "GET" && pathname === "/api/users") {
+    const user = requireUser(req, res);
+    if (!user) return;
+    if (user.role !== "admin") return json(res, 403, { error: "Admin access required" });
+    const users = db.prepare("SELECT id, name, email, role, created_at FROM users ORDER BY created_at DESC").all();
+    return json(res, 200, { users });
+  }
+
+  const userRoleMatch = pathname.match(/^\/api\/users\/(\d+)\/role$/);
+  if (userRoleMatch && method === "PUT") {
+    const user = requireUser(req, res);
+    if (!user) return;
+    if (user.role !== "admin") return json(res, 403, { error: "Admin access required" });
+    const body = await readBody(req);
+    const role = cleanRole(String(body.role || ""));
+    db.prepare("UPDATE users SET role = ? WHERE id = ?").run(role, Number(userRoleMatch[1]));
+    return json(res, 200, { ok: true });
   }
 
   if (method === "GET" && pathname === "/api/posts") {
@@ -218,6 +344,7 @@ async function handleApi(req, res, url) {
   if (method === "POST" && pathname === "/api/posts") {
     const user = requireUser(req, res);
     if (!user) return;
+    if (!canWritePosts(user)) return json(res, 403, { error: "Only admins and blog writers can create posts" });
     const body = await readBody(req);
     const missing = validateRequired(["title", "content"], body);
     if (missing) return json(res, 400, { error: missing });
@@ -266,7 +393,7 @@ async function handleApi(req, res, url) {
 
     const post = db.prepare("SELECT * FROM posts WHERE id = ?").get(Number(postMatch[1]));
     if (!post) return json(res, 404, { error: "Post not found" });
-    if (post.author_id !== user.id) return json(res, 403, { error: "You can only change your own posts" });
+    if (!canModifyPost(user, post)) return json(res, 403, { error: "Only admins or the post author can change this post" });
 
     if (method === "DELETE") {
       db.prepare("DELETE FROM posts WHERE id = ?").run(post.id);
