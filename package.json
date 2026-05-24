@@ -1,0 +1,17 @@
+{
+  "name": "blogging-platform",
+  "version": "1.0.0",
+  "description": "A full-stack blogging platform with authentication, posts, and comments.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "blog",
+    "rest-api",
+    "sqlite",
+    "auth"
+  ],
+  "author": "",
+  "license": "MIT"
+}

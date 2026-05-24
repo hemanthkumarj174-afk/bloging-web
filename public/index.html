@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Inkline Blog</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <button class="brand" data-route="home">Inkline</button>
+      <nav>
+        <button data-route="home">Home</button>
+        <button data-route="dashboard" class="auth-only">Dashboard</button>
+        <button data-route="new-post" class="auth-only">Write</button>
+        <button data-route="profile" class="auth-only">Profile</button>
+        <button data-route="login" class="guest-only">Login</button>
+        <button data-route="register" class="guest-only primary">Register</button>
+        <button id="logoutBtn" class="auth-only">Logout</button>
+      </nav>
+    </header>
+
+    <main id="app" class="shell"></main>
+
+    <template id="postCardTemplate">
+      <article class="post-card">
+        <img class="post-image" alt="" />
+        <div class="post-body">
+          <div class="meta"></div>
+          <h2></h2>
+          <p></p>
+          <div class="tags"></div>
+          <button class="text-button">Read article</button>
+        </div>
+      </article>
+    </template>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
