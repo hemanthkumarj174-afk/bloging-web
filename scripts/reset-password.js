@@ -24,6 +24,9 @@ db.exec(`
     name TEXT NOT NULL,
     email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'writer',
+    reset_token_hash TEXT DEFAULT '',
+    reset_expires_at INTEGER DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -49,6 +52,17 @@ db.exec(`
     FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
   );
 `);
+
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name);
+  if (!columns.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+ensureColumn("users", "role", "TEXT NOT NULL DEFAULT 'writer'");
+ensureColumn("users", "reset_token_hash", "TEXT DEFAULT ''");
+ensureColumn("users", "reset_expires_at", "INTEGER DEFAULT 0");
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
