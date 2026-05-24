@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "A full-stack blogging platform with authentication, posts, and comments.",
   "main": "server.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "start": "node server.js"
   },

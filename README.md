@@ -22,6 +22,10 @@ Open [http://localhost:3000](http://localhost:3000).
 
 The SQLite database is created at `data/blog.sqlite` the first time the server runs.
 
+On Vercel, the API runs as a serverless function and uses `/tmp/blogging-platform/blog.sqlite`.
+That storage is temporary, so demo data can disappear when the function cold-starts. Use a hosted
+database such as Vercel Postgres, Neon, Supabase, or Turso for persistent production data.
+
 ## API Overview
 
 | Method | Endpoint | Purpose |
